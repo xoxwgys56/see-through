@@ -229,7 +229,8 @@ class TransparentVAEDecoder(torch.nn.Module):
             break
 
         result = torch.stack(result, dim=0)
-        median = torch.median(result, dim=0).values
+        # flatten: MPS sort only supports up to 4 dims
+        median = torch.median(result.flatten(1), dim=0).values.view(result.shape[1:])
         return median
 
     @torch.no_grad()

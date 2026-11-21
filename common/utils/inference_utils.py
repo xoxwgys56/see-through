@@ -18,6 +18,38 @@ import numpy as np
 import torch
 from PIL import Image
 
+from diffusers.models.attention_processor import AttnProcessor2_0
+
+DEVICE = 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
+
+
+class ChunkedAttnProcessor(AttnProcessor2_0):
+    """SDPA over batch chunks so the attention matrix stays under max_bytes.
+    MPS has no memory-efficient SDPA and materializes the full heads x N x N matrix."""
+
+    def __init__(self, max_bytes=1 << 30):
+        super().__init__()
+        self.max_bytes = max_bytes
+
+    def __call__(self, attn, hidden_states, encoder_hidden_states=None, attention_mask=None, temb=None, *args, **kwargs):
+        h = hidden_states
+        n_q = h.shape[1] if h.ndim == 3 else h.shape[2] * h.shape[3]
+        n_k = n_q if encoder_hidden_states is None else encoder_hidden_states.shape[1]
+        chunk = max(1, self.max_bytes // (attn.heads * n_q * n_k * h.element_size()))
+        if chunk >= h.shape[0] or attention_mask is not None or temb is not None:
+            return super().__call__(attn, h, encoder_hidden_states, attention_mask, temb, *args, **kwargs)
+        out = []
+        for i in range(0, h.shape[0], chunk):
+            e = None if encoder_hidden_states is None else encoder_hidden_states[i: i + chunk]
+            out.append(super().__call__(attn, h[i: i + chunk], e, None, None, *args, **kwargs))
+        return torch.cat(out)
+
+
+def _chunk_attention_on_mps(*models):
+    if DEVICE == 'mps':
+        for m in models:
+            m.set_attn_processor(ChunkedAttnProcessor())
+
 VALID_BODY_PARTS_V2 = [
     'hair', 'headwear', 'face', 'eyes', 'eyewear', 'ears', 'earwear', 'nose', 'mouth', 
     'neck', 'neckwear', 'topwear', 'handwear', 'bottomwear', 'legwear', 'footwear', 
@@ -62,13 +94,14 @@ def apply_layerdiff(
                 layerdiff_pipeline.trans_vae.decoder.load_state_dict(td_sd)
                 print(f'load vae from {vae_ckpt}')
 
-        layerdiff_pipeline.vae.to(dtype=torch.bfloat16, device='cuda')
-        layerdiff_pipeline.trans_vae.to(dtype=torch.bfloat16, device='cuda')
-        layerdiff_pipeline.unet.to(dtype=torch.bfloat16, device='cuda')
-        layerdiff_pipeline.text_encoder.to(dtype=torch.bfloat16, device='cuda')
-        layerdiff_pipeline.text_encoder_2.to(dtype=torch.bfloat16, device='cuda')
+        layerdiff_pipeline.vae.to(dtype=torch.bfloat16, device=DEVICE)
+        layerdiff_pipeline.trans_vae.to(dtype=torch.bfloat16, device=DEVICE)
+        layerdiff_pipeline.unet.to(dtype=torch.bfloat16, device=DEVICE)
+        layerdiff_pipeline.text_encoder.to(dtype=torch.bfloat16, device=DEVICE)
+        layerdiff_pipeline.text_encoder_2.to(dtype=torch.bfloat16, device=DEVICE)
+        _chunk_attention_on_mps(layerdiff_pipeline.unet, layerdiff_pipeline.vae)
         if group_offload:
-            layerdiff_pipeline.enable_group_offload('cuda', num_blocks_per_group=1)
+            layerdiff_pipeline.enable_group_offload(DEVICE, num_blocks_per_group=1)
 
     pipeline = layerdiff_pipeline
     if cache_tag_embeds:
@@ -218,10 +251,11 @@ def apply_marigold(srcp, pretrained: str, num_inference_steps=-1, seed=0, save_d
     if marigold_pipeline is None:
         unet = UNetFrameConditionModel.from_pretrained(pretrained, subfolder='unet')
         marigold_pipeline = MarigoldDepthPipeline.from_pretrained(pretrained, unet=unet)
-        marigold_pipeline.to(device='cuda', dtype=torch.bfloat16)
+        marigold_pipeline.to(device=DEVICE, dtype=torch.bfloat16)
+        _chunk_attention_on_mps(marigold_pipeline.unet, marigold_pipeline.vae)
 
         if group_offload:
-            marigold_pipeline.enable_group_offload('cuda', num_blocks_per_group=1)
+            marigold_pipeline.enable_group_offload(DEVICE, num_blocks_per_group=1)
 
     pipe = marigold_pipeline
 
